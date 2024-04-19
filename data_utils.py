@@ -35,30 +35,41 @@ class TextMelLoader(torch.utils.data.Dataset):
         return (text, mel)
 
     def get_mel(self, filename):
-        if not self.load_mel_from_disk:
-            audio, sampling_rate = load_wav_to_torch(filename)
-            if sampling_rate != self.stft.sampling_rate:
-                raise ValueError("{} {} SR doesn't match target {} SR".format(
-                    sampling_rate, self.stft.sampling_rate))
-            audio_norm = audio / self.max_wav_value
-            audio_norm = audio_norm.unsqueeze(0)
-            audio_norm = torch.autograd.Variable(audio_norm, requires_grad=False)
-            melspec = self.stft.mel_spectrogram(audio_norm)
-            melspec = torch.squeeze(melspec, 0)
-        else:
-            melspec = torch.from_numpy(np.load(filename))
-            assert melspec.size(0) == self.stft.n_mel_channels, (
-                'Mel dimension mismatch: given {}, expected {}'.format(
-                    melspec.size(0), self.stft.n_mel_channels))
+        try:
+          if not self.load_mel_from_disk:
+              audio, sampling_rate = load_wav_to_torch(filename)
+              if sampling_rate != self.stft.sampling_rate:
+                  raise ValueError("{} {} SR doesn't match target {} SR".format(
+                      sampling_rate, self.stft.sampling_rate))
+              audio_norm = audio / self.max_wav_value
+              audio_norm = audio_norm.unsqueeze(0)
+              audio_norm = torch.autograd.Variable(audio_norm, requires_grad=False)
+              melspec = self.stft.mel_spectrogram(audio_norm)
+              melspec = torch.squeeze(melspec, 0)
+          else:
+              melspec = torch.from_numpy(np.load(filename))
+              assert melspec.size(0) == self.stft.n_mel_channels, (
+                  'Mel dimension mismatch: given {}, expected {}'.format(
+                      melspec.size(0), self.stft.n_mel_channels))
 
-        return melspec
+          return melspec
+
+        except RuntimeError as e:
+            print("RuntimeError occurred:", e)
+            return None
 
     def get_text(self, text):
         text_norm = torch.IntTensor(text_to_sequence(text, self.text_cleaners))
         return text_norm
 
     def __getitem__(self, index):
-        return self.get_mel_text_pair(self.audiopaths_and_text[index])
+        sample = self.get_mel_text_pair(self.audiopaths_and_text[index])
+        if sample[1] is None:  # mel이 None인 경우
+            # 현재 인덱스를 조정하여 다음 유효한 샘플로 이동
+            index = (index + 1) % len(self)
+            return self.__getitem__(index)  
+        else:
+            return sample
 
     def __len__(self):
         return len(self.audiopaths_and_text)
