@@ -1,38 +1,10 @@
-# *****************************************************************************
-#  Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-#  Redistribution and use in source and binary forms, with or without
-#  modification, are permitted provided that the following conditions are met:
-#      * Redistributions of source code must retain the above copyright
-#        notice, this list of conditions and the following disclaimer.
-#      * Redistributions in binary form must reproduce the above copyright
-#        notice, this list of conditions and the following disclaimer in the
-#        documentation and/or other materials provided with the distribution.
-#      * Neither the name of the NVIDIA CORPORATION nor the
-#        names of its contributors may be used to endorse or promote products
-#        derived from this software without specific prior written permission.
-#
-#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-#  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-#  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-#  DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR ANY
-#  DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-#  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-#  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-#  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-#  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# *****************************************************************************
 import argparse
 import json
 import os
 import torch
 
-#=====START: ADDED FOR DISTRIBUTED======
-from distributed import init_distributed, apply_gradient_allreduce, reduce_tensor
-from torch.utils.data.distributed import DistributedSampler
-#=====END:   ADDED FOR DISTRIBUTED======
+# 필요한 경우에만 사용
+# from torch.nn.parallel import DataParallel
 
 from torch.utils.data import DataLoader
 from glow import WaveGlow, WaveGlowLoss
@@ -64,26 +36,15 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
           checkpoint_path, with_tensorboard):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    #=====START: ADDED FOR DISTRIBUTED======
-    if num_gpus > 1:
-        init_distributed(rank, num_gpus, group_name, **dist_config)
-    #=====END:   ADDED FOR DISTRIBUTED======
 
     criterion = WaveGlowLoss(sigma)
     model = WaveGlow(**waveglow_config).cuda()
 
-    #=====START: ADDED FOR DISTRIBUTED======
-    if num_gpus > 1:
-        model = apply_gradient_allreduce(model)
-    #=====END:   ADDED FOR DISTRIBUTED======
-
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    if fp16_run:
-        from apex import amp
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
+    # 필요한 경우에만 사용
+    # model = DataParallel(model)
 
-    # Load checkpoint if one exists
     iteration = 0
     if checkpoint_path != "":
         model, optimizer, iteration = load_checkpoint(checkpoint_path, model,
@@ -91,16 +52,11 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
         iteration += 1  # next iteration is iteration + 1
 
     trainset = Mel2Samp(**data_config)
-    # =====START: ADDED FOR DISTRIBUTED======
-    train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
-    # =====END:   ADDED FOR DISTRIBUTED======
     train_loader = DataLoader(trainset, num_workers=1, shuffle=False,
-                              sampler=train_sampler,
                               batch_size=batch_size,
                               pin_memory=False,
                               drop_last=True)
 
-    # Get shared output_directory ready
     if rank == 0:
         if not os.path.isdir(output_directory):
             os.makedirs(output_directory)
@@ -113,7 +69,6 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
 
     model.train()
     epoch_offset = max(0, int(iteration / len(train_loader)))
-    # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, epochs):
         print("Epoch: {}".format(epoch))
         for i, batch in enumerate(train_loader):
@@ -125,22 +80,13 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
             outputs = model((mel, audio))
 
             loss = criterion(outputs)
-            if num_gpus > 1:
-                reduced_loss = reduce_tensor(loss.data, num_gpus).item()
-            else:
-                reduced_loss = loss.item()
 
-            if fp16_run:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
-
+            loss.backward()
             optimizer.step()
 
-            print("{}:\t{:.9f}".format(iteration, reduced_loss))
+            print("{}:\t{:.9f}".format(iteration, loss.item()))
             if with_tensorboard and rank == 0:
-                logger.add_scalar('training_loss', reduced_loss, i + len(train_loader) * epoch)
+                logger.add_scalar('training_loss', loss.item(), i + len(train_loader) * epoch)
 
             if (iteration % iters_per_checkpoint == 0):
                 if rank == 0:
@@ -161,25 +107,16 @@ if __name__ == "__main__":
                         help='name of group for distributed')
     args = parser.parse_args()
 
-    # Parse configs.  Globals nicer in this case
     with open(args.config) as f:
         data = f.read()
     config = json.loads(data)
     train_config = config["train_config"]
     global data_config
     data_config = config["data_config"]
-    global dist_config
-    dist_config = config["dist_config"]
     global waveglow_config
     waveglow_config = config["waveglow_config"]
 
     num_gpus = torch.cuda.device_count()
-    if num_gpus > 1:
-        if args.group_name == '':
-            print("WARNING: Multiple GPUs detected but no distributed group set")
-            print("Only running 1 GPU.  Use distributed.py for multiple GPUs")
-            num_gpus = 1
-
     if num_gpus == 1 and args.rank != 0:
         raise Exception("Doing single GPU training on rank > 0")
 
